@@ -218,6 +218,19 @@ Callers that genuinely need mid-call cancellation should write their Python func
 accept a cooperative cancellation token (a value in `args` they check between safe points).
 The module provides no built-in token.
 
+### `Poll` is its own method, not a shorter `Await`
+
+A workflow task has a deadline, and if the Python call outlives it the task must return in time to arm a retry
+that rejoins the call. `Await` cannot serve that: it waits until ctx ends, so it returns at the very deadline the
+task needed to beat, and with `ctx.Err()`, which a caller has to tell apart from a real failure. Making `Await`
+return early would break the synchronous callers (`CallAndAwait` inside a single request), which want the whole
+budget and read a deadline as a failure.
+
+`Poll` waits for 4/5 of the time left until ctx's deadline and reports a still-running call as `(false, nil)`,
+never as an error. The fraction matches the foreman's `Poll` in Microbus, which bridges an open-ended flow to a
+bounded request the same way. A completed call is checked before anything else, so a result that is already in is
+delivered even when ctx has no time left.
+
 ## Things that would surprise future-me
 
 - **`BaseDir` defaults to a `MkdirTemp` directory created by `New`**, not by `Start`. The

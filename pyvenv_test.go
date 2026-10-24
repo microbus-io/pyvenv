@@ -113,6 +113,20 @@ func TestResult_Unknown(t *testing.T) {
 	}
 }
 
+// TestPoll_Unknown asserts Poll on a never-issued callID returns (false, ErrUnknown).
+func TestPoll_Unknown(t *testing.T) {
+	t.Parallel()
+	v, _ := New(Config{})
+	defer v.Close(context.Background())
+	done, err := v.Poll(context.Background(), "no-such-id", nil)
+	if done {
+		t.Error("Poll on unknown callID: done=true, want false")
+	}
+	if !errors.Is(err, ErrUnknown) {
+		t.Errorf("Poll on unknown callID: got %v, want ErrUnknown", err)
+	}
+}
+
 // TestClose_Idempotent asserts a second Close is a no-op.
 func TestClose_Idempotent(t *testing.T) {
 	t.Parallel()
@@ -440,6 +454,83 @@ func TestResult_AfterCompletion(t *testing.T) {
 	}
 	if out.V != 42 {
 		t.Errorf("Result value = %d, want 42", out.V)
+	}
+}
+
+// TestPoll_StillRunningThenDone walks the deadline-bounded pattern: a Poll whose ctx expires before the Python
+// work finishes returns (false, nil) before that deadline and without consuming the entry; a later Poll with time
+// to spare delivers the result; and a Poll on an already-expired ctx returns the ctx error.
+func TestPoll_StillRunningThenDone(t *testing.T) {
+	if !hasPython3(t) {
+		return
+	}
+	v, err := New(Config{
+		Sources: []string{
+			`import time
+def slow(args):
+    time.sleep(args.get("seconds", 1))
+    return {"done": True}
+`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer v.Close(context.Background())
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := v.Start(startCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	callID, err := v.Call(context.Background(), "slow", map[string]any{"seconds": 1})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+
+	// The window is a fraction of the deadline, so Poll returns before the ctx expires
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer shortCancel()
+	t0 := time.Now()
+	done, err := v.Poll(shortCtx, callID, nil)
+	if done || err != nil {
+		t.Fatalf("first Poll: got (%v, %v), want (false, nil)", done, err)
+	}
+	if shortCtx.Err() != nil {
+		t.Errorf("first Poll returned after its ctx expired (%v elapsed)", time.Since(t0))
+	}
+
+	longCtx, longCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer longCancel()
+	var out struct {
+		Done bool `json:"done"`
+	}
+	done, err = v.Poll(longCtx, callID, &out)
+	if !done || err != nil {
+		t.Fatalf("second Poll: got (%v, %v), want (true, nil)", done, err)
+	}
+	if !out.Done {
+		t.Errorf("second Poll result = %+v, want Done=true", out)
+	}
+
+	// The entry was consumed
+	done, err = v.Poll(longCtx, callID, nil)
+	if done || !errors.Is(err, ErrUnknown) {
+		t.Errorf("third Poll: got (%v, %v), want (false, ErrUnknown)", done, err)
+	}
+
+	// An expired ctx returns its error for a call that is still running
+	callID, err = v.Call(context.Background(), "slow", map[string]any{"seconds": 1})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	expiredCtx, expiredCancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer expiredCancel()
+	<-expiredCtx.Done()
+	done, err = v.Poll(expiredCtx, callID, nil)
+	if done || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Poll on expired ctx: got (%v, %v), want (false, DeadlineExceeded)", done, err)
 	}
 }
 

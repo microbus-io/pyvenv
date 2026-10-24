@@ -74,8 +74,11 @@ func main() {
 
     // Or split for callers that need to outlive their ctx (e.g. workflow tasks):
     callID, _ := v.Call(ctx, "embed", map[string]any{"text": "another"})
-    // ... store callID somewhere durable, return early, come back later ...
-    _ = v.Await(ctx, callID, &out)
+    // ... store callID somewhere durable, then wait for most of ctx's remaining time ...
+    done, _ := v.Poll(ctx, callID, &out)
+    if !done {
+        // ... still running: return early and Poll the same callID again later ...
+    }
 }
 ```
 
@@ -99,6 +102,7 @@ def embed(args):
 | `Start` | Create venv on disk (if absent) via `python3 -m venv`. Run `pip install` if `Requirements` changed since last successful install. Spawn `worker.py` under the venv's Python. Load `Sources` via one `define` frame. Block until the worker emits its initial `ready` frame. |
 | `Call` | Marshal `args` to JSON, send a `call` frame, return a `callID`. Does not block on Python execution. |
 | `Await` | Block until the call identified by `callID` completes or ctx expires. On success, unmarshal the result and consume the entry — subsequent Awaits on the same callID return `ErrUnknown`. On ctx expiry, do not consume. |
+| `Poll` | Wait for most of ctx's remaining time, then report. Returns `(true, nil)` on success with the result populated, `(true, <python error>)` on Python failure, and `(false, nil)` if the call is still running when the window ends, without consuming it. A ctx with no deadline is waited on in full. Use it when a deadline-bounded caller must hand the wait on, such as a workflow task that retries. |
 | `Result` | Non-blocking peek. Returns `(false, nil)` while the call is in flight, `(true, nil)` on success with the result populated, `(true, <python error>)` on Python failure, `(false, ErrUnknown)` when the callID is unknown. |
 | `CallAndAwait` | Convenience: `Call` followed by `Await` on the same goroutine. Synchronous shape. |
 | `Close` | Kill the subprocess, wake parked Awaits with `ErrClosed`, remove `BaseDir` on disk. Idempotent. |

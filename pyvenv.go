@@ -682,6 +682,57 @@ func (v *Venv) Result(ctx context.Context, callID string, result any) (ready boo
 	}
 }
 
+// pollBudgetFraction is the share of ctx's remaining time that [Venv.Poll] spends waiting, leaving the rest
+// for the caller to act on a still-running outcome before ctx expires.
+const pollBudgetFraction = 4.0 / 5.0
+
+// Poll waits for the call identified by callID for most of ctx's remaining time, then reports whether it
+// completed. If the call completes within that window, the result is consumed and unmarshaled into *result
+// exactly as with [Venv.Await], and done is true; a Python failure is returned as err, also with done true.
+// If the window ends first, Poll returns done=false and a nil error without consuming the entry, so a later
+// Poll or Await on the same callID re-enters the wait.
+//
+// The window is [pollBudgetFraction] of the time until ctx's deadline, which leaves the caller time to act on
+// a still-running call, such as a workflow task arming a retry that rejoins the call, before its own deadline
+// passes. A ctx with no deadline is waited on in full, as with Await. If ctx is already done, or is canceled
+// during the wait, Poll returns ctx.Err() with done false.
+//
+// Returns [ErrUnknown] when callID is not known to this Venv.
+func (v *Venv) Poll(ctx context.Context, callID string, result any) (done bool, err error) {
+	v.pendingMu.Lock()
+	entry, ok := v.calls[callID]
+	v.pendingMu.Unlock()
+	if !ok {
+		return false, ErrUnknown
+	}
+
+	// A completed call is delivered even when ctx has no time left
+	select {
+	case <-entry.done:
+		return true, v.consume(callID, entry, result)
+	default:
+	}
+	err = ctx.Err()
+	if err != nil {
+		return false, err
+	}
+
+	var window <-chan time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		timer := time.NewTimer(time.Duration(float64(time.Until(deadline)) * pollBudgetFraction))
+		defer timer.Stop()
+		window = timer.C
+	}
+	select {
+	case <-entry.done:
+		return true, v.consume(callID, entry, result)
+	case <-window:
+		return false, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
 // CallAndAwait is the synchronous convenience shape: Call followed by Await on the same
 // goroutine. Use it when the caller is happy to block for the duration of the Python work
 // and does not need to hand the callID across a context boundary (e.g. a workflow task
